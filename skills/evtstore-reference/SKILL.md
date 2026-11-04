@@ -1344,9 +1344,8 @@ When adding a new evtstore-backed feature:
 
 The snippets are shapes, not a package. Symbols that are not `evtstore` exports are
 helpers you write: the two with the most subtle behaviour are shown in full below,
-the rest are listed with their contract and the section that specifies them. The
-small lookups in the wait loop (`resolveBookmarks`, `resolveTarget`,
-`persistedPosition`) are reads over the handler registry and the bookmark collection.
+the rest are listed with their contract and the section that specifies them. Every
+lookup the wait loop calls is defined under [Supporting lookups](#supporting-lookups).
 
 ### Helpers you write
 
@@ -1502,6 +1501,75 @@ export async function waitForProjection(
 }
 
 export const catchUp = (scope, options) => waitForProjection(scope, { head: true }, options);
+```
+
+### Supporting lookups
+
+The wait loop leans on a handful of small readers plus a promise-based delay. They
+are shown here so the snippet above stands on its own; in a real codebase they live
+next to the handler registry.
+
+```ts
+import { setTimeout as delay } from 'node:timers/promises';
+
+type RegisteredHandler = {
+	name: string;
+	streams: string[];
+	runOnce: () => Promise<number>;
+	getPosition: () => Promise<unknown>; // the persisted bookmark position
+};
+
+type WaitTarget = { position: unknown } | { aggregateId: string } | { head: true };
+
+declare const handlers: Map<string, RegisteredHandler>;
+declare const handlerFailures: Map<string, { position: unknown; message: string }>;
+declare const provider: {
+	getLastEventFor: (
+		streams: string[],
+		aggregateId?: string
+	) => Promise<{ position: unknown } | undefined>;
+};
+
+/** A bookmark name, or a stream expanded to every handler that consumes it. */
+const resolveBookmarks = (scope: string | string[]): string[] =>
+	(Array.isArray(scope) ? scope : [scope]).flatMap((name) => {
+		if (handlers.has(name)) return [name];
+
+		const consumers = [...handlers.values()].filter((handler) => handler.streams.includes(name));
+		if (consumers.length === 0) throw new Error(`unknown scope "${name}"`);
+		return consumers.map((handler) => handler.name);
+	});
+
+/** The target position, resolved once so it cannot chase a moving head. */
+const resolveTarget = async (bookmarks: string[], target: WaitTarget): Promise<string> => {
+	const streams = [...new Set(bookmarks.flatMap((name) => handlers.get(name)?.streams ?? []))];
+
+	if ('position' in target) return String(target.position);
+
+	if ('aggregateId' in target) {
+		const event = await provider.getLastEventFor(streams, target.aggregateId);
+		if (!event) throw new Error(`no event for ${target.aggregateId}`);
+		return String(event.position);
+	}
+
+	const head = await provider.getLastEventFor(streams);
+	if (!head) throw new Error(`no events for ${streams.join(', ')}`);
+	return String(head.position);
+};
+
+const persistedPosition = (name: string): Promise<unknown> =>
+	handlers.get(name)?.getPosition() ?? Promise.resolve(null);
+
+const atOrAfter = (position: unknown, wanted: string): boolean =>
+	position != null && BigInt(String(position)) >= BigInt(wanted);
+
+/** A failure recorded at or after the target means the event never landed. */
+const lastHandlerFailureAtOrAfter = (bookmarks: string[], wanted: string) =>
+	bookmarks
+		.map((name) => handlerFailures.get(name))
+		.find((failure) => failure !== undefined && atOrAfter(failure.position, wanted));
+
+const handlerExists = (name: string): boolean => handlers.has(name);
 ```
 
 ### Command call

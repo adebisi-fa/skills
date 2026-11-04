@@ -82,7 +82,13 @@ const HELPERS = [
 	'registerProjectionHandler',
 	'coalescedRun',
 	'isDuplicateKey',
-	'createProjectionHandler'
+	'createProjectionHandler',
+	'resolveBookmarks',
+	'resolveTarget',
+	'persistedPosition',
+	'atOrAfter',
+	'lastHandlerFailureAtOrAfter',
+	'handlerExists'
 ];
 
 const SYMBOLS = [
