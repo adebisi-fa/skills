@@ -879,9 +879,17 @@ the event context is in scope; the appendices show both wirings.
 handler write → guard wrapper (rewrites filter + $set.lastPosition) → driver
 ```
 
+It covers deletes too. A handler that clears rows before rewriting them — a
+credential index moving a phone alias does exactly that — needs the delete filtered
+by the same position, or a replay removes a row a later event owns and then
+re-inserts the row the replayed event knew about.
+
 The wrapper must be inert outside a handler (routes and migrations write the same
 collections) and must detect a handler writing one document twice for an event,
-since the second write is the one case the guard cannot admit.
+since the second write is the one case the guard cannot admit. Methods that write
+and return a document in one call (`findOneAndUpdate` and friends) cannot be wrapped
+without reimplementing the driver's return shape: refuse them rather than let them
+pass unguarded.
 
 ## Projection Throughput
 
