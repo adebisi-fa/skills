@@ -405,8 +405,10 @@ Name a stream to cover every handler on it. A wait that times out raises
 `ProjectionFailedError`. Map both to a retryable response rather than rendering
 stale data.
 
-> In production the position guard from Step 5 is applied by one client wrapper, not
-> by hand at every write. See `Projection Integrity` in the reference skill.
+> `waitForProjection` is a helper you write, not an `evtstore` export; the reference
+> skill shows its implementation. In production the position guard from Step 5 is
+> applied by one client wrapper, not by hand at every write — see `Projection
+> Integrity` there too.
 
 ## Step 7: Add Queries
 

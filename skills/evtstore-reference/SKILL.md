@@ -894,16 +894,25 @@ Both can be batched without weakening the guarantees above.
 instead of changing handlers:
 
 ```ts
-export function batchingBookmark(provider, name, { maxPending = 200, maxDelayMs = 1000 } = {}) {
+export function batchingBookmark(
+	provider,
+	name,
+	{ maxPending = 200, maxDelayMs = 1000, beforePersist }: BatchingBookmarkOptions = {}
+) {
 	const inner = createBookmark(provider, name);
-	return new BatchingBookmark(inner, maxPending, maxDelayMs);
+	return new BatchingBookmark(inner, maxPending, maxDelayMs, beforePersist);
 }
 
 const departmentsModel = createHandler(
-	batchingBookmark(provider, 'departments-model'),
+	batchingBookmark(provider, 'departments-model', {
+		beforePersist: () => flushProjectionWrites() // never persist ahead of the buffer
+	}),
 	['departments']
 );
 ```
+
+`BatchingBookmark` is a helper you write, not an `evtstore` export — the full class is
+in [Snippet Reference](#batchingbookmark).
 
 Rules that keep this safe:
 
@@ -1332,6 +1341,168 @@ When adding a new evtstore-backed feature:
 15. test folds, command behavior, replay convergence, and projection updates
 
 ## Snippet Reference
+
+The snippets are shapes, not a package. Symbols that are not `evtstore` exports are
+helpers you write: the two with the most subtle behaviour are shown in full below,
+the rest are listed with their contract and the section that specifies them. The
+small lookups in the wait loop (`resolveBookmarks`, `resolveTarget`,
+`persistedPosition`) are reads over the handler registry and the bookmark collection.
+
+### Helpers you write
+
+| Helper | Contract | Specified in |
+| --- | --- | --- |
+| `BatchingBookmark` | coalesces `setPosition`; flushes before a read and on shutdown | below |
+| `waitForProjection` | resolves once every handler in scope applied the target position | below |
+| `catchUp` | `waitForProjection(scope, { head: true })` | below |
+| `installWriteBuffer` | per-collection queues, flushed as ordered `bulkWrite` batches | Projection Throughput |
+| `installPositionGuards` | rewrites handler writes with the position guard | Projection Integrity |
+| `flushProjectionWrites` | flushes the buffer at the end of every handler run | Projection Throughput |
+| `flushAllBookmarks` | flushes every registered bookmark | Shutdown |
+| `registerShutdownFlush` | one signal listener per process, which owns the exit | Shutdown |
+| `registerProjectionHandler` | bookmark to streams to collections registry | Operating Projections |
+| `coalescedRun` | one in-flight run per bookmark | Reading Your Own Writes |
+| `isDuplicateKey` | duplicate-key detection, so a replayed upsert is a no-op | Projection Integrity |
+
+### BatchingBookmark
+
+```ts
+import type { ProviderBookmark } from 'evtstore';
+
+export type BatchingBookmarkOptions = {
+	maxPending?: number;
+	maxDelayMs?: number;
+	/** Runs before persisting: flush the projection write buffer here. */
+	beforePersist?: () => Promise<void>;
+};
+
+export class BatchingBookmark implements ProviderBookmark {
+	readonly name: string;
+	private latest: unknown;
+	private pending = 0;
+	private timer: ReturnType<typeof setTimeout> | null = null;
+	private chain: Promise<void> = Promise.resolve();
+
+	constructor(
+		private readonly inner: ProviderBookmark,
+		private readonly maxPending = 200,
+		private readonly maxDelayMs = 1000,
+		private readonly beforePersist?: () => Promise<void>
+	) {
+		this.name = inner.name;
+	}
+
+	async getPosition(): Promise<unknown> {
+		// A handler reads its position at start and on reset(); the read must see
+		// what was persisted, not what is still deferred.
+		await this.flush();
+		return this.inner.getPosition();
+	}
+
+	async setPosition(position: unknown): Promise<void> {
+		// Newest wins: only the latest position is ever written.
+		this.latest = position;
+		this.pending += 1;
+		if (this.pending >= this.maxPending) return this.flush();
+		this.schedule();
+	}
+
+	async flush(): Promise<void> {
+		this.clearTimer();
+		if (this.pending === 0) return;
+
+		const position = this.latest;
+		this.latest = undefined;
+		this.pending = 0;
+
+		const write = this.chain
+			.catch(() => undefined)
+			.then(() => this.beforePersist?.())
+			.then(() => this.inner.setPosition(position));
+		this.chain = write.catch(() => undefined);
+
+		try {
+			await write;
+		} catch (err) {
+			// Keep it for the next attempt; a newer position wins if one arrived.
+			if (this.latest === undefined) {
+				this.latest = position;
+				this.pending = Math.max(1, this.pending);
+			}
+			this.schedule();
+			throw err;
+		}
+	}
+
+	private schedule(): void {
+		if (this.timer) return;
+		this.timer = setTimeout(() => {
+			this.flush().catch((err) => console.error('[evtstore] bookmark flush failed', err));
+		}, this.maxDelayMs);
+		this.timer.unref?.();
+	}
+
+	private clearTimer(): void {
+		if (!this.timer) return;
+		clearTimeout(this.timer);
+		this.timer = null;
+	}
+}
+```
+
+Register each instance so shutdown can flush it, or `flushAllBookmarks()` will miss it.
+
+### Waiting for a projection
+
+```ts
+export class ProjectionLagError extends Error {}
+export class ProjectionFailedError extends Error {
+	constructor(
+		readonly bookmark: string,
+		readonly target: string
+	) {
+		super(`projection ${bookmark} failed at or after ${target}`);
+	}
+}
+
+export async function waitForProjection(
+	scope: string | string[],
+	target: { position: unknown } | { aggregateId: string } | { head: true },
+	{ timeoutMs = 5_000, slowWarnMs = 1_000 } = {}
+): Promise<void> {
+	const bookmarks = resolveBookmarks(scope); // a stream expands to all its handlers
+	const wanted = await resolveTarget(bookmarks, target); // resolved once, never moving
+	const started = Date.now();
+	let interval = 20;
+
+	for (;;) {
+		// Read first: a projection already at the target must not pay for a run.
+		const positions = await Promise.all(bookmarks.map(persistedPosition));
+
+		// A dead-lettered event still advances the bookmark, so check it before
+		// declaring success.
+		const failure = lastHandlerFailureAtOrAfter(bookmarks, wanted);
+		if (failure) throw new ProjectionFailedError(failure.bookmark, wanted);
+
+		if (positions.every((position) => atOrAfter(position, wanted))) {
+			if (Date.now() - started >= slowWarnMs) {
+				console.warn(`[evtstore] slow projection wait: ${bookmarks.join(', ')}`);
+			}
+			return;
+		}
+
+		if (Date.now() - started >= timeoutMs) {
+			throw new ProjectionLagError(bookmarks, wanted, Date.now() - started);
+		}
+
+		for (const name of bookmarks) await coalescedRun(name); // drive the catch-up
+		await delay(interval);
+		interval = Math.min(250, Math.round(interval * 1.5));
+	}
+}
+
+export const catchUp = (scope, options) => waitForProjection(scope, { head: true }, options);
+```
 
 ### Command call
 

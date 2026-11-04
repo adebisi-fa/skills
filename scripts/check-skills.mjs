@@ -39,6 +39,9 @@ const value = (name, fallback) => {
 const modulesDir = value('modules', repoRoot);
 const strict = flag('strict');
 
+// Sections where a timer is the subject (a coalescing flush), not a wait substitute.
+const TIMER_SECTIONS = new Set(['batchingbookmark']);
+
 const problems = [];
 const warnings = [];
 const report = (message) => problems.push(message);
@@ -46,6 +49,8 @@ const report = (message) => problems.push(message);
 const SKILLS = [
 	{
 		path: 'skills/evtstore-reference/SKILL.md',
+		// The reference is where the helpers are introduced; the quickstart links to it.
+		helpers: true,
 		required: [
 			'projection-integrity',
 			'projection-throughput',
@@ -60,6 +65,24 @@ const SKILLS = [
 		path: 'skills/evtstore-quickstart/SKILL.md',
 		required: ['step-6-wait-for-the-projection-dont-sleep']
 	}
+];
+
+// Symbols the skills introduce themselves. Each must be defined in a code block or
+// listed in the helper table, so no example references a name that does not exist.
+const HELPERS = [
+	'BatchingBookmark',
+	'batchingBookmark',
+	'waitForProjection',
+	'catchUp',
+	'installWriteBuffer',
+	'installPositionGuards',
+	'flushProjectionWrites',
+	'flushAllBookmarks',
+	'registerShutdownFlush',
+	'registerProjectionHandler',
+	'coalescedRun',
+	'isDuplicateKey',
+	'createProjectionHandler'
 ];
 
 const SYMBOLS = [
@@ -121,12 +144,26 @@ function checkStructure(skill) {
 		if (!headingSet.has(match[1])) report(`${skill.path}: anchor "#${match[1]}" has no heading`);
 	}
 
-	// A fixed delay may appear only where it is being called out as wrong.
+	// Every helper the skill introduces is either implemented or listed.
+	if (skill.helpers) for (const helper of HELPERS) {
+		const defined = new RegExp(`(?:class|function|const|let)\\s+${helper}\\b`).test(text);
+		const listed = new RegExp(`\\|\\s*\`${helper}\``).test(text);
+		if (!defined && !listed) {
+			report(`${skill.path}: helper "${helper}" is used but neither defined nor listed`);
+		}
+	}
+
+	// A fixed delay may appear only where it is being called out as wrong, or where
+	// it is a scheduling timer rather than a substitute for a projection wait.
+	let section = '';
 	let inAntiPattern = false;
 	lines.forEach((line, index) => {
-		if (/^#{2,4}\s/.test(line)) inAntiPattern = /anti-pattern/i.test(line);
+		if (/^#{2,4}\s/.test(line)) {
+			section = slugify(line.replace(/^#+\s*/, ''));
+			inAntiPattern = /anti-pattern/i.test(line);
+		}
 		if (!/setTimeout\(|sleep\(/.test(line)) return;
-		if (inAntiPattern) return;
+		if (inAntiPattern || TIMER_SECTIONS.has(section)) return;
 		report(`${skill.path}:${index + 1}: fixed-delay guidance outside the anti-pattern section`);
 	});
 }
