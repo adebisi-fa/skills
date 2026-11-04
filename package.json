@@ -1,0 +1,13 @@
+{
+	"name": "yrka-skills",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "node scripts/check-skills.mjs"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-node": "^5.5.7",
+		"evtstore": "^12.0.1",
+		"mongodb": "^6.19.0"
+	}
+}
