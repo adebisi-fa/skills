@@ -1195,10 +1195,10 @@ document, so nothing is rebuilt — and documents that predate the guard accept 
 first write on replay, double-applying increments.
 
 ```bash
-es:rebuild --list                     # bookmarks, streams, bookmark presence
-es:rebuild --all                      # preview; refuses when rows predate the guard
-es:rebuild --all --allow-unstamped --yes
-es:rebuild --bookmark=tenants-model --collection=tenants --yes
+npm run es:rebuild -- --list                       # bookmarks, streams, bookmark presence
+npm run es:rebuild -- --all                        # preview; refuses when rows predate the guard
+npm run es:rebuild -- --all --allow-unstamped --yes
+npm run es:rebuild -- --bookmark=tenants-model --collection=tenants --yes
 ```
 
 A rebuild script should preview by default, refuse when a targeted collection holds
@@ -1343,7 +1343,7 @@ When adding a new evtstore-backed feature:
 ## Snippet Reference
 
 The snippets are shapes, not a package. Symbols that are not `evtstore` exports are
-helpers you write: the two with the most subtle behaviour are shown in full below,
+helpers you write: the three with the most subtle behaviour are shown in full below,
 the rest are listed with their contract and the section that specifies them. Every
 lookup the wait loop calls is defined under [Supporting lookups](#supporting-lookups).
 
@@ -1454,7 +1454,16 @@ Register each instance so shutdown can flush it, or `flushAllBookmarks()` will m
 ### Waiting for a projection
 
 ```ts
-export class ProjectionLagError extends Error {}
+export class ProjectionLagError extends Error {
+	constructor(
+		readonly bookmarks: string[],
+		readonly target: string,
+		readonly elapsedMs: number
+	) {
+		super(`projection did not reach ${target} within ${elapsedMs} ms`);
+	}
+}
+
 export class ProjectionFailedError extends Error {
 	constructor(
 		readonly bookmark: string,
@@ -1471,6 +1480,7 @@ export async function waitForProjection(
 ): Promise<void> {
 	const bookmarks = resolveBookmarks(scope); // a stream expands to all its handlers
 	const wanted = await resolveTarget(bookmarks, target); // resolved once, never moving
+	if (wanted === null) return; // empty stream: nothing to wait for
 	const started = Date.now();
 	let interval = 20;
 
@@ -1500,7 +1510,8 @@ export async function waitForProjection(
 	}
 }
 
-export const catchUp = (scope, options) => waitForProjection(scope, { head: true }, options);
+export const catchUp = (scope: string | string[], options: { timeoutMs?: number } = {}) =>
+	waitForProjection(scope, { head: true }, options);
 ```
 
 ### Supporting lookups
@@ -1541,20 +1552,18 @@ const resolveBookmarks = (scope: string | string[]): string[] =>
 	});
 
 /** The target position, resolved once so it cannot chase a moving head. */
-const resolveTarget = async (bookmarks: string[], target: WaitTarget): Promise<string> => {
+const resolveTarget = async (bookmarks: string[], target: WaitTarget): Promise<string | null> => {
 	const streams = [...new Set(bookmarks.flatMap((name) => handlers.get(name)?.streams ?? []))];
 
 	if ('position' in target) return String(target.position);
 
 	if ('aggregateId' in target) {
 		const event = await provider.getLastEventFor(streams, target.aggregateId);
-		if (!event) throw new Error(`no event for ${target.aggregateId}`);
-		return String(event.position);
+		return event ? String(event.position) : null; // no such aggregate yet
 	}
 
 	const head = await provider.getLastEventFor(streams);
-	if (!head) throw new Error(`no events for ${streams.join(', ')}`);
-	return String(head.position);
+	return head ? String(head.position) : null; // empty stream: nothing to reach
 };
 
 const persistedPosition = (name: string): Promise<unknown> =>
@@ -1566,8 +1575,11 @@ const atOrAfter = (position: unknown, wanted: string): boolean =>
 /** A failure recorded at or after the target means the event never landed. */
 const lastHandlerFailureAtOrAfter = (bookmarks: string[], wanted: string) =>
 	bookmarks
-		.map((name) => handlerFailures.get(name))
-		.find((failure) => failure !== undefined && atOrAfter(failure.position, wanted));
+		.flatMap((name) => {
+			const failure = handlerFailures.get(name);
+			return failure && atOrAfter(failure.position, wanted) ? [{ bookmark: name, ...failure }] : [];
+		})
+		.at(0);
 
 const handlerExists = (name: string): boolean => handlers.has(name);
 ```
@@ -1628,8 +1640,8 @@ await catchUp('departments');
 ### Operate it
 
 ```bash
-es:health                 # per-handler gap, idle, orphan, recent handler errors
-es:rebuild --all --yes    # drop documents and bookmarks, then restart to replay
+npm run es:health                                     # gap, idle, orphan, recent handler errors
+npm run es:rebuild -- --all --allow-unstamped --yes   # drop documents and bookmarks, then restart
 ```
 
 If you are unsure how to implement a new feature, start with one aggregate, one command file, one projection collection, and one query module. Keep the first version small, then extend it.
