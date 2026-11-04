@@ -27,6 +27,10 @@ By the end, you should be able to:
 - set up a domain with `createDomain(...)`
 - persist events in MongoDB
 - project events into read models
+- make projection writes replay-safe
+- batch projection writes and coalesce bookmark persistence
+- read your own write without sleeping
+- operate projections: health, rebuilds, graceful shutdown
 - expose query functions against projection collections
 
 ## Mental Model
@@ -607,7 +611,8 @@ departmentsModel.handle('departments', 'departmentCreated', async (id, event, me
 			dataContext: event.dataContext,
 			deleted: false,
 			createdAt: meta.timestamp.toISOString(),
-			updatedAt: meta.timestamp.toISOString()
+			updatedAt: meta.timestamp.toISOString(),
+			lastPosition: meta.position
 		},
 		{ upsert: true }
 	);
@@ -617,7 +622,8 @@ departmentsModel.handle('departments', 'departmentUpdated', async (id, event, me
 	const client = await getMongoClient();
 	const collection = client.db().collection<DepartmentProjection>('departments');
 	const updateFields: Partial<DepartmentProjection> = {
-		updatedAt: meta.timestamp.toISOString()
+		updatedAt: meta.timestamp.toISOString(),
+		lastPosition: meta.position
 	};
 
 	if (event.name !== undefined) updateFields.name = event.name;
@@ -634,6 +640,7 @@ departmentsModel.handle('departments', 'departmentManagerAdded', async (id, even
 		{ departmentId: id },
 		{
 			$addToSet: { managers: event.userPhone },
+			$set: { lastPosition: meta.position },
 			$set: { updatedAt: meta.timestamp.toISOString() }
 		}
 	);
@@ -669,14 +676,18 @@ departmentsModel.handle('departments', 'departmentDeleted', async (id, event, me
 });
 ```
 
+> The examples below record `lastPosition` on every write. The filter guard that
+> makes a replay a no-op is covered in [Projection Integrity](#projection-integrity);
+> with a client wrapper you write it once, without one you add it to each filter.
+
 ### Projection rules
 
 - use `handle(stream, eventType, handler)`
 - use `meta.timestamp` for projection timestamps
 - use `replaceOne(..., { upsert: true })` for create events
 - use `$set`, `$addToSet`, `$pull`, `$unset` for updates
-- make handlers idempotent where possible
-- start handlers during app bootstrap
+- make every mutable write replay-safe with the position guard (see [Projection Integrity](#projection-integrity)); idempotency is not optional once bookmarks can be deferred
+- start handlers during app bootstrap, after indexes exist
 
 ### Handler options
 
@@ -770,6 +781,179 @@ Use this for composite read models or process managers that coordinate across ag
 Official references:
 
 - https://seikho.github.io/evtstore/#/docs/multiple-streams
+
+## Projection Integrity
+
+A handler will eventually process the same event twice: a crash, a redeploy, or a
+deliberate rebuild replays the log from a persisted position. Every write must be
+safe to apply twice.
+
+### Stamp the applied position
+
+Every mutable projection document records the position of the event it reflects.
+`meta.position` is the BSON timestamp the store assigned to that event.
+
+```ts
+await collection.updateOne(
+	{ departmentId: id },
+	{
+		$set: {
+			name: event.name,
+			updatedAt: meta.timestamp.toISOString(),
+			lastPosition: meta.position
+		}
+	}
+);
+```
+
+### Filter the write by it
+
+The guard is a **filter fragment**, not a read-then-check:
+
+```ts
+const guarded = {
+	...filter,
+	$or: [{ lastPosition: { $lt: meta.position } }, { lastPosition: { $exists: false } }]
+};
+```
+
+- a replayed event matches no document and changes nothing;
+- an older event cannot move state backwards;
+- a document written before the guard existed matches once, then is stamped.
+
+A read-then-check is not equivalent: it adds a race window to handlers that
+already read their own documents.
+
+### Creates and upserts
+
+Keep the upsert and the guard together. On replay the guarded filter matches
+nothing, so the upsert attempts an insert and meets the unique index — treat a
+duplicate key as "already applied":
+
+```ts
+try {
+	await collection.replaceOne(
+		guarded,
+		{ ...doc, lastPosition: meta.position },
+		{ upsert: true }
+	);
+} catch (err) {
+	if (!isDuplicateKey(err)) throw err;
+}
+```
+
+Without a unique index on the document key, that insert succeeds and you get a
+duplicate row. **Every projection collection needs a unique index on the key its
+upserts filter by, and handlers must not start before those indexes exist.**
+
+### Counters and arrays
+
+`$inc`, `$push` and `$pull` are the operations that break a replay. They carry the
+same guard on the parent document, which works because each is driven by an event
+on that document. Prefer `$addToSet` when the element has a stable identity.
+
+One rule falls out of this: **a handler writes a given document at most once per
+event**, because the guard admits one write per position. If two updates are
+needed, merge them into one operator update. Report the case if you cannot — a
+silently skipped second write is worse than a loud one.
+
+### Position, not aggregate version
+
+A guard on `{aggregateId, version}` is enough only when a document is written
+exclusively by one aggregate's events. Documents written by several aggregates — a
+reviewer cache rebuilt from `requisitions`, `categories` and `departments` events,
+an activity ledger fed by `pictureCaptures` and `agentPayouts` — break it: versions
+are only ordered inside one aggregate, so a legitimate write whose version happens
+to be lower is silently dropped.
+
+Event positions are ordered across the whole store, so one marker is correct for
+every write pattern.
+
+### Apply it centrally
+
+Per-write guards leave the invariant one forgotten call away from broken, and every
+new handler must remember. Prefer a single wrapper that rewrites the guard in while
+the event context is in scope; the appendices show both wirings.
+
+```
+handler write → guard wrapper (rewrites filter + $set.lastPosition) → driver
+```
+
+The wrapper must be inert outside a handler (routes and migrations write the same
+collections) and must detect a handler writing one document twice for an event,
+since the second write is the one case the guard cannot admit.
+
+## Projection Throughput
+
+Two round trips dominate a projection loop: the write itself, and the bookmark.
+Both can be batched without weakening the guarantees above.
+
+### Coalesce bookmark writes
+
+`evtstore` persists the bookmark after **every** event. Decorate the bookmark
+instead of changing handlers:
+
+```ts
+export function batchingBookmark(provider, name, { maxPending = 200, maxDelayMs = 1000 } = {}) {
+	const inner = createBookmark(provider, name);
+	return new BatchingBookmark(inner, maxPending, maxDelayMs);
+}
+
+const departmentsModel = createHandler(
+	batchingBookmark(provider, 'departments-model'),
+	['departments']
+);
+```
+
+Rules that keep this safe:
+
+- flush **before** `getPosition` — a handler reads its position at start and on `reset()`;
+- flush **before any bookmark write**, and never persist a position ahead of
+  buffered projection writes;
+- flush on shutdown, and retain the position when a write fails so it is retried;
+- the crash window becomes one window (default 200 events or one second), which is
+  acceptable only because of the position guard.
+
+### Buffer projection writes
+
+Queue `updateOne` / `replaceOne` / `insertOne` per collection and flush them as one
+ordered `bulkWrite`:
+
+- **Flush before a read of that collection** — including cursors. `find()` returns
+  before any I/O, so the flush belongs on the first terminal call (`toArray`,
+  `next`, `hasNext`, `forEach`, async iteration), not when the cursor is built.
+- **Flush at the end of a handler run** (`postRun`), so a caller that awaited the
+  run can read its own write.
+- **Never buffer event appends or bookmark writes.**
+- Buffer only collections projection handlers write. A collection that routes or
+  migrations also write keeps its immediate semantics — including surfacing write
+  errors synchronously.
+- On a failed batch, re-apply in order, tolerate duplicate keys, re-queue the first
+  real failure and its tail, and mark **that collection** blocked. An enqueue
+  against a blocked collection flushes and then throws rather than dropping writes.
+- Cap the queue, and keep a kill switch for both features.
+
+### Order of the two wrappers
+
+The guard must run **while the event context is in scope**, so it wraps the buffer —
+the buffer defers the driver call to flush time, when the context is gone.
+
+```
+handler write → guard wrapper (rewrites filter/update) → buffer (queues) → driver
+```
+
+### What it buys
+
+Measured on one 5 000-event burst through a single handler over a loopback
+connection:
+
+| | Before | After |
+| --- | --- | --- |
+| Wall time | 1 391 ms | 278 ms |
+| Projection round trips | 5 000 | 5 (`bulkWrite`, one per 1 000-event page) |
+| Bookmark writes | 5 000 | 25 |
+
+On a link where a round trip costs milliseconds the difference is larger still.
 
 ## Queries
 
@@ -902,25 +1086,139 @@ Guidelines:
 - include it in projections for filtering
 - if you support both legacy and new data, design filters carefully
 
-## Eventual Consistency
+## Reading Your Own Writes
 
-Projection reads may lag behind writes.
+Projection reads are eventually consistent, and the handler loop does not wake on an
+append: `evtstore` polls on a one-second timer. A fixed delay therefore cannot answer
+"has my write reached the projection?" — a 500 ms wait covers roughly half the poll
+window, and a coalesced run can return before it fetched the page containing your
+event.
 
-If you need immediate feedback after a write, choose one of these patterns:
+### Wait on the position
 
-- return success without immediately querying the projection
-- wait briefly before read-after-write in user-facing flows
-- read aggregate state directly when appropriate for internal logic
-
-Example:
+A handler's persisted position is the only durable statement of how far it has
+applied. Resolve the target once, then wait for every handler in scope to reach it:
 
 ```ts
+await departmentCmd.create(id, payload);
+await waitForProjection('departments', { aggregateId: id });
+// every handler for the stream has applied the event; reads are current
+```
+
+- name a **stream** to wait for every handler on it — a user-account write has to
+  cover the account, the credential index and the activity ledger together; name a
+  **bookmark** to wait for one;
+- the target is an `aggregateId`, an explicit `position`, or the stream `head`;
+- drive the catch-up yourself through one coalesced run per bookmark; do not lean on
+  the tail loop for latency;
+- bound the wait, back off, and warn once when it is slow.
+
+### Failure is not success
+
+- `ProjectionLagError` — the handler did not get there in time. Map it to a
+  retryable response; do not render stale data.
+- `ProjectionFailedError` — the handler **recorded a failure at or after your
+  target**. A `continueOnError` handler advances its bookmark past an event whose
+  callback threw, so a position check alone reports success on a write that never
+  landed. Record handler failures (bookmark, position, event type, message) and
+  refuse to resolve across one.
+
+Authentication and provisioning are the one place a short, best-effort wait is
+right: sign-in must not fail because a read model is slow.
+
+### Make the catch-up helper deterministic
+
+If the code already has a `debouncedRunOnce(label, run)` helper, note that it
+resolves with an *in-flight* run — which may have fetched its page before your
+write. Have it finish by waiting for the stream head:
+
+```ts
+export function debouncedRunOnce(label: string, run: () => Promise<unknown>) {
+	return coalescedRun(label, run).then(() =>
+		handlerExists(label) ? waitForProjection(label, { head: true }) : undefined
+	);
+}
+```
+
+### Anti-pattern
+
+```ts
+// Never: neither fast nor correct.
 await departmentCmd.create(id, payload);
 await new Promise((resolve) => setTimeout(resolve, 300));
 const department = await queryDepartments.getById(id);
 ```
 
-Use waiting sparingly. Prefer designing flows that tolerate projection lag.
+## Operating Projections
+
+### Publish what you run
+
+At startup, write the handler registry — bookmark name, streams, projection
+collections — to a collection. A standalone health check or rebuild script can then
+work without importing application modules, and without a second list of names that
+drifts from the code.
+
+### Health
+
+Report per bookmark: persisted position, stream head, gap, and state.
+
+| State | Meaning | Fails the check? |
+| --- | --- | --- |
+| `ok` | caught up | no |
+| `BEHIND` | gap above the threshold | yes |
+| `IDLE` | registered, but its streams hold no events | no |
+| `NEVER-PERSISTED` | events are waiting and no position exists | yes |
+| `ORPHAN` | a bookmark whose handler no longer exists | no |
+
+Account for the coalescing window when choosing the threshold: a persisted bookmark
+may trail by one window (200 events or one second) while the projection is current.
+A removed handler must not fail the check forever, and a handler that has never had
+an event to process is idle, not behind.
+
+Record handler failures durably (one document per failure) and fail the check when
+one arrived in the window.
+
+### Rebuild
+
+**Rebuilding means dropping the projection documents and the bookmark together.**
+Deleting only the bookmark replays the log but every guarded write matches no
+document, so nothing is rebuilt — and documents that predate the guard accept their
+first write on replay, double-applying increments.
+
+```bash
+es:rebuild --list                     # bookmarks, streams, bookmark presence
+es:rebuild --all                      # preview; refuses when rows predate the guard
+es:rebuild --all --allow-unstamped --yes
+es:rebuild --bookmark=tenants-model --collection=tenants --yes
+```
+
+A rebuild script should preview by default, refuse when a targeted collection holds
+documents without `lastPosition` (dropping them discards the only projection of
+events written before the guard), verify the collections are empty afterwards, and
+tell the operator to **restart**: handlers keep their position in memory, so a
+deleted bookmark is only observed by a new process.
+
+## Shutdown
+
+Flush deferred bookmarks when the process stops — and own the exit once you do.
+
+```ts
+const flush = () => flushAllBookmarks();
+
+process.prependOnceListener('SIGTERM', () => void flush().then(() => exit()));
+process.prependOnceListener('SIGINT', () => void flush().then(() => exit()));
+```
+
+- **A signal listener suppresses Node's default termination.** The listener that
+  suppresses it must finish the job, or the process hangs — and with a Mongo
+  connection pool the event loop never drains.
+- Under an adapter that closes the server itself (SvelteKit's `adapter-node`), do
+  not exit on the signal: flush, then exit on the adapter's shutdown event, after
+  the server has closed.
+- **Prepend** the handler so the flush starts before the framework's exit path.
+- Register **once per process**, not once per module evaluation. A dev server
+  re-evaluates modules on HMR, and a module-local flag stacks a listener per reload;
+  guard the registration on a `globalThis` symbol.
 
 ## Testing Guidance
 
@@ -968,6 +1266,19 @@ await departmentCmd.create('department-123', {
 });
 ```
 
+### Test the replay, not just the happy path
+
+- **Replay convergence:** project a batch, snapshot the documents, flush bookmarks,
+  delete the bookmark, reset the handler, replay, and deep-compare. Any
+  non-idempotent write shows up here.
+- **Counters:** replay an `$inc` event and assert the counter moved once.
+- **Guards through the real driver:** use an in-memory MongoDB for handler tests; a
+  mocked collection will not exercise a unique index or a BSON position comparison.
+- **Kill switches:** assert the disabled path writes per event.
+- **Staged rollout rehearsal:** a test gated behind an environment flag that
+  exercises every projection area, a replay and a short soak at each deployment
+  stage — guards only, then bookmark coalescing, then the write buffer.
+
 ## Best Practices
 
 - use past-tense event names
@@ -975,7 +1286,13 @@ await departmentCmd.create('department-123', {
 - keep folds pure and deterministic
 - validate in commands, not in projections
 - keep projections read-optimized
-- treat projections as disposable, rebuildable views
+- treat projections as disposable, rebuildable views — and rebuild by dropping the
+  documents, not just the bookmark
+- guard every mutable projection write by event position
+- keep a unique index on every key a handler upserts by
+- wait on positions after a write, never on a delay
+- flush buffered writes before persisting a bookmark, and on shutdown
+- treat the coalescing window as the replay window when sizing alerts
 - skip emitting events for no-op updates
 - keep `performedBy`, timestamps, and deletion metadata where useful for auditability
 
@@ -987,6 +1304,12 @@ await departmentCmd.create('department-123', {
 - placing business validation inside projection handlers
 - encoding transient UI concerns into event names
 - overloading one aggregate with unrelated responsibilities
+- `setTimeout`/`sleep` as a read-after-write strategy
+- a single `lastVersion` on a document written by several aggregates
+- persisting a bookmark ahead of buffered projection writes
+- read-then-check guards (`findOne` and then decide)
+- buffering collections that routes or migrations also write
+- adding a signal listener without owning the exit that it now suppresses
 
 ## End-to-End Checklist
 
@@ -996,12 +1319,17 @@ When adding a new evtstore-backed feature:
 2. implement `createAggregate(...)`
 3. implement `createCommands(...)`
 4. register the aggregate in `createDomain(...)`
-5. add projection document types
+5. add projection document types, with `lastPosition` on every mutable document
 6. add projection handlers with `handle(...)`
-7. start projection handlers during bootstrap
-8. add query functions against projection collections
-9. wire commands into routes, services, or RPC handlers
-10. test folds, command behavior, and projection updates
+7. add a unique index for every key a handler upserts by, before handlers start
+8. guard every mutable write by event position — through the wrapper if you have one
+9. start projection handlers during bootstrap, after the indexes exist
+10. wait on the position after a write; never on a delay
+11. flush buffered writes at the end of every run and on shutdown
+12. publish the handler registry so health and rebuild tools can read it
+13. add query functions against projection collections
+14. wire commands into routes, services, or RPC handlers
+15. test folds, command behavior, replay convergence, and projection updates
 
 ## Snippet Reference
 
@@ -1038,4 +1366,191 @@ const { _id: _, ...rest } = doc;
 return rest as DepartmentProjection;
 ```
 
+### Guarded update
+
+```ts
+await collection.updateOne(
+	{
+		departmentId: id,
+		$or: [{ lastPosition: { $lt: meta.position } }, { lastPosition: { $exists: false } }]
+	},
+	{ $set: { name: event.name, lastPosition: meta.position } }
+);
+```
+
+### Wait for the projection
+
+```ts
+await waitForProjection('departments', { aggregateId: id });
+// or, for every handler on the stream, up to its head:
+await catchUp('departments');
+```
+
+### Operate it
+
+```bash
+es:health                 # per-handler gap, idle, orphan, recent handler errors
+es:rebuild --all --yes    # drop documents and bookmarks, then restart to replay
+```
+
 If you are unsure how to implement a new feature, start with one aggregate, one command file, one projection collection, and one query module. Keep the first version small, then extend it.
+
+## Appendix A: Generic Node.js wiring
+
+The smallest shape that delivers the guarantees above. Each piece is described in
+the sections it implements; this is how they compose.
+
+```ts
+// projection/runtime.ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { MongoClient } from 'mongodb';
+import type { EventMeta } from 'evtstore';
+
+// 1. Event context: the handler wrapper binds it, the write wrappers read it.
+const eventStorage = new AsyncLocalStorage<EventMeta>();
+export const currentEvent = () => eventStorage.getStore();
+
+// 2. One client for the read side. Install the buffer FIRST, then the guard, so
+//    the guard runs while the event context is still in scope.
+let clientPromise: Promise<MongoClient> | undefined;
+export function getProjectionClient(): Promise<MongoClient> {
+  clientPromise ??= (async () => {
+    const client = await MongoClient.connect(process.env.MONGO_URI!);
+    installWriteBuffer(client, projectionCollections);   // queues handler writes
+    installPositionGuards(client, projectionCollections); // rewrites filter + lastPosition
+    return client;
+  })();
+  return clientPromise;
+}
+
+// 3. Guard wrapper: intercepts updateOne/replaceOne/insertOne/bulkWrite on
+//    projection collections. `currentEvent()` undefined => pass straight through.
+//    The guard must be the OUTER wrapper: the buffer defers the driver call to
+//    flush time, when the event context is gone.
+
+// 4. Handler wrapper: binds the event, flushes the buffer at the end of every run.
+export function createProjectionHandler(bookmark, streams, options = {}) {
+  const handler = createHandler(bookmark, streams, {
+    ...options,
+    hooks: {
+      ...options.hooks,
+      postRun: async (...args) => {
+        await options.hooks?.postRun?.(...args);
+        await flushProjectionWrites();
+      }
+    }
+  });
+
+  const register = handler.handle.bind(handler);
+  handler.handle = (stream, type, callback) =>
+    register(stream, type, (id, event, meta) =>
+      eventStorage.run(meta, () => callback(id, event, meta))
+    );
+
+  registerProjectionHandler({ name: handler.name, streams, handler });
+  return handler;
+}
+```
+
+Bootstrap, once per process:
+
+```ts
+async function bootstrap() {
+  const db = (await getProjectionClient()).db();
+  await initializeIndexes(db);          // unique keys before any handler starts
+  await persistHandlerRegistry(db);     // bookmark -> streams -> collections
+  startHandlers();                      // handler.start() for every model
+  registerShutdownFlush();              // flush on SIGTERM/SIGINT, then exit
+}
+```
+
+Bookmarks are decorated at creation, not at bootstrap:
+
+```ts
+const departmentsModel = createProjectionHandler(
+  batchingBookmark(provider, 'departments-model'),
+  ['departments']
+);
+```
+
+Environment switches for both optimisations, read once at install time:
+
+```bash
+DISABLE_EVTSTORE_WRITE_BUFFER=true
+DISABLE_EVTSTORE_BOOKMARK_BATCHING=true
+EVTSTORE_BOOKMARK_MAX_PENDING=200
+EVTSTORE_BOOKMARK_MAX_DELAY_MS=1000
+EVTSTORE_WRITE_BUFFER_LIMIT=500
+```
+
+## Appendix B: SvelteKit wiring
+
+SvelteKit adds three wrinkles: the server has no single bootstrap hook, the dev
+server re-evaluates modules on HMR, and `adapter-node` owns the shutdown.
+
+```ts
+// src/lib/server/projection-shared.ts
+export async function getMongoClient(uri = process.env.MONGO_URI) {
+  const client = await connect(uri);
+  // Buffer first, guard second — the guard must wrap the queue.
+  installWriteBuffer(client, projectionCollections);
+  installPositionGuards(client, projectionCollections);
+  return client;
+}
+```
+
+Bootstrap on the first request, then never again:
+
+```ts
+// src/hooks.server.ts
+let started = false;
+
+export const handle: Handle = async ({ event, resolve }) => {
+  if (!started) {
+    started = true;
+    void bootstrapProjection();   // indexes -> registry -> handler.start()
+    registerShutdownFlush();      // guarded on a globalThis symbol
+  }
+  return resolve(event);
+};
+```
+
+- **Start handlers after the indexes exist.** A replayed upsert relies on its unique
+  key to turn the duplicate insert into a no-op; starting first reopens the race.
+- **HMR**: the dev server re-evaluates `hooks.server.ts`, resetting module-level
+  flags. Keep the once-only guards (bootstrap, shutdown registration) on
+  `globalThis`, or a long session stacks listeners.
+- **Shutdown**: `adapter-node` closes the HTTP server and emits
+  `sveltekit:shutdown`; it never calls `process.exit`, and open Mongo sockets keep
+  the loop alive. Flush on the signal, exit on that event. Under `vite dev` there is
+  no adapter, so the listener that suppressed the default exit must exit itself.
+
+Reading your own write in a form action:
+
+```ts
+import { waitForProjection, ProjectionLagError } from '$lib/server/projection/consistency';
+
+try {
+  await departmentCmd.update(id, { name });
+  await waitForProjection('departments', { aggregateId: id });
+} catch (err) {
+  if (err instanceof ProjectionLagError) return fail(503, { error: 'Try again in a moment' });
+  throw err;
+}
+```
+
+Keep two scripts beside the app, both without application imports:
+
+```json
+{
+  "scripts": {
+    "es:health": "node scripts/es-health.mjs",
+    "es:rebuild": "node scripts/es-rebuild.mjs",
+    "es:rollout-check": "ES_ROLLOUT_CHECK=1 vitest run src/.../rollout-check.integration.test.ts"
+  }
+}
+```
+
+The rollout check is a gated integration test: it runs the areas, a replay and a
+short soak once per deployment stage (`DISABLE_*` flags), so the staged rollout is
+rehearsed against a real database before it is done in production.

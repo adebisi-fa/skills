@@ -386,7 +386,29 @@ Official references:
 - https://seikho.github.io/evtstore/#/docs/event-handlers
 - https://seikho.github.io/evtstore/#/docs/event-handlers?id=handleroptions
 
-## Step 6: Add Queries
+## Step 6: Wait for the projection, don't sleep
+
+A handler polls on a one-second timer, so a fixed delay covers roughly half the
+window and cannot tell you the write landed. Wait on the position instead:
+
+```ts
+import { waitForProjection } from './projection-consistency';
+
+await departmentCmd.create(id, payload);
+await waitForProjection('departments', { aggregateId: id });
+
+// now a read of the departments projection reflects the command
+```
+
+Name a stream to cover every handler on it. A wait that times out raises
+`ProjectionLagError`; one whose event was dead-lettered raises
+`ProjectionFailedError`. Map both to a retryable response rather than rendering
+stale data.
+
+> In production the position guard from Step 5 is applied by one client wrapper, not
+> by hand at every write. See `Projection Integrity` in the reference skill.
+
+## Step 7: Add Queries
 
 ```ts
 import type { WithId } from 'mongodb';
@@ -418,12 +440,20 @@ export const queryDepartments = {
 5. create one projection
 6. create one query module
 7. invoke commands without runtime `type`
-8. bootstrap projections with `start()`
+8. stamp `lastPosition` and guard every mutable write
+9. give every upsert key a unique index
+10. bootstrap projections with `start()`, after the indexes exist
+11. wait on the position after a write, never on a delay
+12. flush buffered writes at the end of every run and on shutdown
 
 ## When to Use the Reference Skill
 
 Use `evtstore-reference` when you need:
 
+- projection integrity, throughput and the write buffer
+- reading your own writes without sleeping
+- health, rebuilds and graceful shutdown
+- generic Node.js and SvelteKit wiring appendices
 - aggregate persistence
 - domain cache
 - multi-stream handlers
